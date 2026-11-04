@@ -1,4 +1,4 @@
 {
   "BTC:above:50000": true,
-  "BTC:above:80000": true
+  "BTC:above:80000": false
 }
