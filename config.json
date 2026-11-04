@@ -1,6 +1,6 @@
 {
   "alerts": [
-    { "coin": "BTC", "when": "above", "price": 80000 },
+    { "coin": "BTC", "when": "above", "price": 50000 },
     { "coin": "BTC", "when": "below", "price": 70000 },
     { "coin": "ETH", "when": "below", "price": 2000 }
   ]
