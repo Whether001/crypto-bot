@@ -1,0 +1,40 @@
+name: Deploy worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Загрузить воркер в Cloudflare
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          secrets: |
+            TELEGRAM_TOKEN
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+      - name: Подключить Telegram к воркеру
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          WORKER_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          if [ -z "$WORKER_URL" ]; then
+            echo "Не получил адрес воркера. Открой шаг выше и посмотри адрес вида https://coin-pulse.имя.workers.dev"
+            exit 1
+          fi
+          echo "Адрес воркера: $WORKER_URL"
+          curl -sS --fail "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook" --data-urlencode "url=${WORKER_URL}"
+          echo
