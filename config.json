@@ -1,8 +1,10 @@
 {
   "alerts": [
-    { "coin": "BTC", "when": "above", "price": 80000 },
+    { "coin": "BTC", "when": "above", "price": 80300 },
     { "coin": "BTC", "when": "above", "price": 85000 },
     { "coin": "BTC", "when": "above", "price": 90000 },
+    { "coin": "BTC", "when": "below", "price": 85000 },
+    { "coin": "BTC", "when": "below", "price": 80300 },
     { "coin": "BTC", "when": "below", "price": 78000 },
     { "coin": "BTC", "when": "below", "price": 70000 },
     { "coin": "ETH", "when": "below", "price": 2000 }
