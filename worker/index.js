@@ -1,12 +1,17 @@
-// Бот цен для Telegram на Cloudflare Workers (бесплатно).
-// 1) Каждые 5 секунд смотрит цену и пишет, когда сработал уровень из config.json.
-// 2) Показывает кнопки: Цена BTC, Цена ETH, Все цены, Мои уровни.
+// Общий бот цен для Telegram на Cloudflare Workers (бесплатно).
+// У каждого человека свои уровни. Цена проверяется каждые 5 секунд.
+// Уровни добавляются обычным сообщением: «BTC выше 85000».
 
 const INTERVAL_MS = 5000; // как часто проверять цену
-const CONFIG_TTL_MS = 60000; // как часто перечитывать config.json
-const COINS = ["BTC", "ETH", "SOL"];
+const SEND_PER_TICK = 25; // сколько уведомлений отправлять за одну проверку
+const MAX_ALERTS = 10; // уровней на одного человека
+const OWNER_MAX_ALERTS = 30; // уровней у владельца бота
+const DEFAULT_MAX_USERS = 50; // сколько людей максимум (можно поменять в MAX_USERS)
+const MAX_FAILS = 50; // после стольких неудачных отправок человек удаляется
 
-const DEFAULT_CONFIG_URL = "https://raw.githubusercontent.com/Whether001/crypto-bot/main/config.json";
+const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LTC", "LINK", "AVAX", "DOT"];
+const MENU_COINS = ["BTC", "ETH", "SOL"];
+
 const DEFAULT_PRICE_BASE = "https://api.coinbase.com";
 const DEFAULT_TG_BASE = "https://api.telegram.org";
 
@@ -14,14 +19,87 @@ const KEYBOARD = {
   keyboard: [
     [{ text: "Цена BTC" }, { text: "Цена ETH" }],
     [{ text: "Все цены" }, { text: "Мои уровни" }],
+    [{ text: "Добавить уровень" }],
   ],
   resize_keyboard: true,
   is_persistent: true,
 };
 
-const usd = (n) =>
-  "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const usdShort = (n) => "$" + Number(n).toLocaleString("en-US");
+const HELP =
+  "Я слежу за ценой крипты и пишу тебе, когда цена дойдёт до твоего уровня.\n\n" +
+  "Как добавить уровень: напиши сообщением, например:\n" +
+  "BTC выше 85000\n" +
+  "ETH ниже 2000\n\n" +
+  "Можно несколько строк сразу и писать 85k или 85 000.\n\n" +
+  "Кнопки внизу: цена BTC и ETH, все цены, твои уровни. Чтобы удалить уровень, открой «Мои уровни» и нажми «Удалить».\n\n" +
+  "Монеты: " + COINS.join(", ") + ". Максимум " + MAX_ALERTS + " уровней на человека.";
+
+const ADD_HELP =
+  "Напиши уровень сообщением, например:\nBTC выше 85000\nETH ниже 2000\n\n" +
+  "«выше» значит «напиши, когда цена поднимется выше», «ниже» значит «когда упадёт ниже». " +
+  "Можно несколько строк сразу.";
+
+// ---------- Форматирование ----------
+
+export function usd(n) {
+  const d = n >= 1 ? 2 : 4;
+  return "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+export function usdShort(n) {
+  return "$" + Number(n).toLocaleString("en-US", { maximumFractionDigits: n >= 1 ? 2 : 6 });
+}
+export function describe(a) {
+  return a.coin + " " + (a.when === "above" ? "выше " : "ниже ") + usdShort(a.price);
+}
+export function alertText(a, price) {
+  const verb = a.when === "above" ? "поднялся выше" : "упал ниже";
+  return a.coin + " " + verb + " " + usdShort(a.price) + ". Сейчас " + usd(price) + ".";
+}
+
+// ---------- Разбор сообщений ----------
+
+export function isHit(rule, price) {
+  if (rule.when === "above") return price >= rule.price;
+  if (rule.when === "below") return price <= rule.price;
+  return false;
+}
+
+export function parseNumber(raw) {
+  let s = String(raw).trim().toLowerCase().replace(/[$\s]/g, "");
+  let mult = 1;
+  if (/[kк]$/.test(s)) {
+    mult = 1000;
+    s = s.slice(0, -1);
+  }
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, "");
+  else s = s.replace(",", ".");
+  if (!/^\d+(\.\d+)?$/.test(s)) return null;
+  const n = Number(s) * mult;
+  return n > 0 && n < 1e9 ? n : null;
+}
+
+const LINE_RE = /^([a-z]{2,6})\s*(выше|ниже|больше|меньше|above|below|>=|<=|>|<)\s*(.+)$/;
+
+export function parseAlertLines(text) {
+  const body = String(text).replace(/^\s*\/add(@\w+)?/i, "");
+  const lines = body.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 20);
+  const items = [];
+  const errors = [];
+  for (const line of lines) {
+    const m = LINE_RE.exec(line.toLowerCase().replace(/^\+\s*/, ""));
+    const price = m ? parseNumber(m[3]) : null;
+    if (!m || price === null) {
+      errors.push(line.slice(0, 60));
+      continue;
+    }
+    const dir = m[2];
+    const when = dir === "выше" || dir === "больше" || dir === "above" || dir[0] === ">" ? "above" : "below";
+    items.push({ coin: m[1].toUpperCase(), when: when, price: price });
+  }
+  return { items, errors };
+}
+
+// ---------- Сеть ----------
 
 async function getPrice(env, coin) {
   const base = env.PRICE_BASE || DEFAULT_PRICE_BASE;
@@ -30,59 +108,82 @@ async function getPrice(env, coin) {
   return Number((await r.json()).data.amount);
 }
 
-async function getConfig(env) {
-  const r = await fetch(env.CONFIG_URL || DEFAULT_CONFIG_URL);
-  if (!r.ok) throw new Error("config " + r.status);
-  return await r.json();
-}
-
-async function sendMessage(env, chatId, text, withKeyboard) {
+async function tg(env, method, body) {
   const base = env.TG_BASE || DEFAULT_TG_BASE;
+  try {
+    const r = await fetch(base + "/bot" + env.TELEGRAM_TOKEN + "/" + method, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    return { ok: false, status: 0 };
+  }
+}
+
+function sendMessage(env, chatId, text, markup) {
   const body = { chat_id: chatId, text: text };
-  if (withKeyboard) body.reply_markup = KEYBOARD;
-  const r = await fetch(base + "/bot" + env.TELEGRAM_TOKEN + "/sendMessage", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return r.ok;
+  if (markup) body.reply_markup = markup;
+  return tg(env, "sendMessage", body);
 }
 
-// ---------- Правила ----------
-
-export function ruleKey(rule) {
-  return rule.coin + ":" + rule.when + ":" + rule.price;
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export function isHit(rule, price) {
-  if (rule.when === "above") return price >= rule.price;
-  if (rule.when === "below") return price <= rule.price;
-  return false;
+// Секрет вебхука считается из токена бота, отдельно хранить его не нужно.
+export async function webhookSecret(token) {
+  return (await sha256Hex(String(token))).slice(0, 48);
 }
 
-export function alertText(rule, price) {
-  const verb = rule.when === "above" ? "поднялся выше" : "упал ниже";
-  return rule.coin + " " + verb + " " + usdShort(rule.price) + ". Сейчас " + usd(price) + ".";
-}
-
-// ---------- Следилка за ценой (Durable Object) ----------
+// ---------- Следилка и хранилище (Durable Object) ----------
 
 export class Watcher {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.cfg = null;
-    this.cfgAt = 0;
-    this.fired = null;
+    this.users = null; // { chatId: { alerts: [{id, coin, when, price, fired}], nextId, fails } }
   }
 
-  // Её вызывает крон раз в минуту, чтобы цепочка проверок точно не оборвалась.
-  async fetch() {
+  async load() {
+    if (this.users === null) this.users = (await this.state.storage.get("users")) || {};
+    return this.users;
+  }
+
+  async save() {
+    await this.state.storage.put("users", this.users);
+  }
+
+  isOwner(chatId) {
+    return String(chatId) === String(this.env.TELEGRAM_CHAT_ID);
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/update") {
+      let update;
+      try {
+        update = await request.json();
+      } catch (e) {
+        return new Response("ok");
+      }
+      try {
+        await this.handleUpdate(update);
+      } catch (e) {
+        console.log("update failed: " + String(e));
+      }
+      return new Response("ok");
+    }
+    // Её вызывает крон раз в минуту, чтобы цепочка проверок точно не оборвалась.
     if ((await this.state.storage.getAlarm()) === null) {
       await this.state.storage.setAlarm(Date.now() + 1000);
     }
     return new Response("ok");
   }
+
+  // ----- проверка цен -----
 
   async alarm() {
     try {
@@ -94,23 +195,15 @@ export class Watcher {
   }
 
   async check() {
-    const now = Date.now();
-    if (!this.cfg || now - this.cfgAt > CONFIG_TTL_MS) {
-      try {
-        this.cfg = await getConfig(this.env);
-        this.cfgAt = now;
-      } catch (e) {
-        this.cfgAt = now - CONFIG_TTL_MS + 10000; // повторим через 10 секунд
-        if (!this.cfg) return;
-      }
+    const users = await this.load();
+    const entries = [];
+    for (const chatId of Object.keys(users)) {
+      for (const a of users[chatId].alerts) entries.push({ chatId: chatId, u: users[chatId], a: a });
     }
-    const alerts = Array.isArray(this.cfg.alerts) ? this.cfg.alerts : [];
-    if (!alerts.length) return;
-
-    if (this.fired === null) this.fired = (await this.state.storage.get("fired")) || {};
+    if (!entries.length) return;
 
     const prices = {};
-    const coins = Array.from(new Set(alerts.map((a) => a.coin)));
+    const coins = Array.from(new Set(entries.map((e) => e.a.coin)));
     await Promise.all(
       coins.map(async (c) => {
         try {
@@ -122,86 +215,202 @@ export class Watcher {
     );
 
     let changed = false;
-    for (const rule of alerts) {
-      const price = prices[rule.coin];
+    const pending = [];
+    for (const e of entries) {
+      const price = prices[e.a.coin];
       if (price === undefined) continue;
-      const key = ruleKey(rule);
-      const hit = isHit(rule, price);
-      if (hit && !this.fired[key]) {
-        const ok = await sendMessage(this.env, this.env.TELEGRAM_CHAT_ID, alertText(rule, price), false);
-        if (ok) {
-          this.fired[key] = true;
-          changed = true;
-        }
-      } else if (!hit && this.fired[key]) {
-        this.fired[key] = false; // цена вернулась, правило снова активно
+      const hit = isHit(e.a, price);
+      if (hit && !e.a.fired) pending.push({ chatId: e.chatId, u: e.u, a: e.a, price: price });
+      else if (!hit && e.a.fired) {
+        e.a.fired = false; // цена вернулась, уровень снова активен
         changed = true;
       }
     }
-    if (changed) await this.state.storage.put("fired", this.fired);
-  }
-}
 
-async function ensureWatcher(env) {
-  const stub = env.WATCHER.get(env.WATCHER.idFromName("main"));
-  await stub.fetch("https://watcher/ensure");
-}
-
-// ---------- Меню ----------
-
-async function answer(env, text) {
-  const t = text.trim().toLowerCase();
-  if (t === "/start" || t === "/menu") return "Привет! Выбери кнопку внизу, и я покажу цену.";
-  if (t === "цена btc") return "BTC сейчас " + usd(await getPrice(env, "BTC"));
-  if (t === "цена eth") return "ETH сейчас " + usd(await getPrice(env, "ETH"));
-  if (t === "все цены") {
-    const prices = await Promise.all(COINS.map((c) => getPrice(env, c)));
-    return COINS.map((c, i) => c + ": " + usd(prices[i])).join("\n");
-  }
-  if (t === "мои уровни") {
-    const alerts = (await getConfig(env)).alerts || [];
-    if (!alerts.length) return "Уровней пока нет.";
-    return (
-      "Я напишу тебе, когда:\n" +
-      alerts
-        .map((a) => "• " + a.coin + " " + (a.when === "above" ? "выше " : "ниже ") + usdShort(a.price))
-        .join("\n")
+    await Promise.all(
+      pending.slice(0, SEND_PER_TICK).map(async (p) => {
+        // пока мы получали цены, человек мог удалить уровень или себя
+        if (users[p.chatId] !== p.u || !p.u.alerts.includes(p.a)) return;
+        const r = await sendMessage(this.env, p.chatId, alertText(p.a, p.price));
+        if (r.ok) {
+          p.a.fired = true;
+          if (p.u.fails) p.u.fails = 0;
+          changed = true;
+        } else if (r.status === 403) {
+          delete users[p.chatId]; // человек заблокировал бота
+          changed = true;
+        } else {
+          p.u.fails = (p.u.fails || 0) + 1;
+          if (p.u.fails >= MAX_FAILS) delete users[p.chatId];
+          changed = true;
+        }
+      })
     );
+    if (changed) await this.save();
   }
-  return "Не понял. Нажми одну из кнопок внизу.";
+
+  // ----- сообщения людей -----
+
+  async handleUpdate(update) {
+    if (update.callback_query) return this.handleCallback(update.callback_query);
+    const msg = update.message;
+    if (!msg || !msg.text || !msg.chat || msg.chat.type !== "private") return;
+    const chatId = String(msg.chat.id);
+
+    const users = await this.load();
+    if (!users[chatId]) {
+      const maxUsers = Number(this.env.MAX_USERS) || DEFAULT_MAX_USERS;
+      if (!this.isOwner(chatId) && Object.keys(users).length >= maxUsers) {
+        await sendMessage(this.env, chatId, "Бот пока заполнен, новых людей не принимаю. Попробуй позже.");
+        return;
+      }
+      users[chatId] = { alerts: [], nextId: 1 };
+      await this.save();
+    }
+
+    let reply;
+    try {
+      reply = await this.answer(chatId, msg.text);
+    } catch (e) {
+      reply = { text: "Не получилось получить данные. Попробуй ещё раз через минуту." };
+    }
+    await sendMessage(this.env, chatId, reply.text, reply.markup || KEYBOARD);
+  }
+
+  async answer(chatId, text) {
+    const t = text.trim();
+    const low = t.toLowerCase();
+    const cmd = t.startsWith("/") ? t.split(/\s+/)[0].replace(/@\w+$/, "").toLowerCase() : "";
+
+    if (cmd === "/start" || cmd === "/help" || cmd === "/menu") return { text: HELP };
+    if (low === "цена btc") return { text: "BTC сейчас " + usd(await getPrice(this.env, "BTC")) };
+    if (low === "цена eth") return { text: "ETH сейчас " + usd(await getPrice(this.env, "ETH")) };
+    if (low === "все цены") {
+      const prices = await Promise.all(MENU_COINS.map((c) => getPrice(this.env, c)));
+      return { text: MENU_COINS.map((c, i) => c + ": " + usd(prices[i])).join("\n") };
+    }
+    if (low === "мои уровни" || cmd === "/list") return this.listReply(chatId);
+    if (low === "добавить уровень") return { text: ADD_HELP };
+    if (cmd === "/clear") {
+      this.users[chatId].alerts = [];
+      await this.save();
+      return { text: "Все уровни удалены." };
+    }
+    if (cmd === "/del") {
+      const n = parseInt(t.split(/\s+/)[1], 10);
+      const alerts = this.users[chatId].alerts;
+      if (!(n >= 1 && n <= alerts.length)) return { text: "Напиши номер уровня из списка, например: /del 2" };
+      alerts.splice(n - 1, 1);
+      await this.save();
+      return this.listReply(chatId, "Удалил.\n\n");
+    }
+    return this.addAlerts(chatId, t);
+  }
+
+  listReply(chatId, prefix) {
+    const alerts = this.users[chatId].alerts;
+    if (!alerts.length) {
+      return { text: (prefix || "") + "Уровней пока нет. Напиши, например: BTC выше 85000" };
+    }
+    const lines = alerts.map((a, i) => i + 1 + ". " + describe(a) + (a.fired ? " (сработал)" : " (жду)"));
+    const buttons = alerts.map((a, i) => ({ text: "Удалить " + (i + 1), callback_data: "d:" + a.id }));
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
+    return { text: (prefix || "") + "Твои уровни:\n" + lines.join("\n"), markup: { inline_keyboard: rows } };
+  }
+
+  async addAlerts(chatId, text) {
+    const parsed = parseAlertLines(text);
+    if (!parsed.items.length && !parsed.errors.length) return { text: HELP };
+
+    const user = this.users[chatId];
+    const limit = this.isOwner(chatId) ? OWNER_MAX_ALERTS : MAX_ALERTS;
+    const out = [];
+
+    for (const it of parsed.items) {
+      if (!COINS.includes(it.coin)) {
+        out.push("• " + it.coin + ": такой монеты нет. Доступны: " + COINS.join(", ") + ".");
+        continue;
+      }
+      if (user.alerts.length >= limit) {
+        out.push("• Лимит " + limit + " уровней. Удали ненужные в «Мои уровни».");
+        break;
+      }
+      if (user.alerts.some((a) => a.coin === it.coin && a.when === it.when && a.price === it.price)) {
+        out.push("• Уже есть: " + describe(it) + ".");
+        continue;
+      }
+      let now = null;
+      try {
+        now = await getPrice(this.env, it.coin);
+      } catch (e) {
+        // ниже скажем, что цену не получили
+      }
+      if (now === null) {
+        out.push("• " + it.coin + ": не смог получить цену, попробуй позже.");
+        continue;
+      }
+      user.alerts.push({ id: user.nextId++, coin: it.coin, when: it.when, price: it.price, fired: false });
+      let line = "• Добавил: " + describe(it) + ". Сейчас " + it.coin + " " + usd(now) + ".";
+      if (isHit(it, now)) line += " Условие уже выполнено, напишу сразу.";
+      out.push(line);
+    }
+    for (const bad of parsed.errors) out.push("• Не понял строку: «" + bad + "».");
+    await this.save();
+    if (parsed.errors.length) out.push("\nПример: BTC выше 85000");
+    return { text: out.join("\n") };
+  }
+
+  async handleCallback(cb) {
+    await tg(this.env, "answerCallbackQuery", { callback_query_id: cb.id });
+    const chat = cb.message && cb.message.chat;
+    if (!chat) return;
+    const chatId = String(chat.id);
+    const users = await this.load();
+    const user = users[chatId];
+    const m = /^d:(\d+)$/.exec(cb.data || "");
+    if (!user || !m) return;
+    const id = Number(m[1]);
+    const before = user.alerts.length;
+    user.alerts = user.alerts.filter((a) => a.id !== id);
+    if (user.alerts.length !== before) await this.save();
+    const r = this.listReply(chatId);
+    await tg(this.env, "editMessageText", {
+      chat_id: chatId,
+      message_id: cb.message.message_id,
+      text: r.text,
+      reply_markup: r.markup || { inline_keyboard: [] },
+    });
+  }
+}
+
+// ---------- Вход ----------
+
+function watcher(env) {
+  return env.WATCHER.get(env.WATCHER.idFromName("main"));
 }
 
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
-      await ensureWatcher(env);
+      await watcher(env).fetch("https://watcher/ensure");
       return new Response("Бот работает");
     }
+    // Принимаем только сообщения, которые пришли от Telegram.
+    const expected = await webhookSecret(env.TELEGRAM_TOKEN);
+    if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== expected) return new Response("ok");
 
-    let update;
+    const body = await request.text();
     try {
-      update = await request.json();
+      await watcher(env).fetch("https://watcher/update", { method: "POST", body: body });
     } catch (e) {
-      return new Response("ok");
+      console.log("forward failed: " + String(e));
     }
-
-    const msg = update.message;
-    if (!msg || !msg.text) return new Response("ok");
-    // Отвечаем только тебе, остальных игнорируем.
-    if (String(msg.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return new Response("ok");
-
-    let text;
-    try {
-      text = await answer(env, msg.text);
-    } catch (e) {
-      text = "Не получилось получить данные. Попробуй ещё раз через минуту.";
-    }
-    await sendMessage(env, msg.chat.id, text, true);
     return new Response("ok");
   },
 
   // Раз в минуту проверяем, что следилка запущена.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(ensureWatcher(env));
+    ctx.waitUntil(watcher(env).fetch("https://watcher/ensure"));
   },
 };
