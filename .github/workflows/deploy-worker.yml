@@ -36,5 +36,8 @@ jobs:
             exit 1
           fi
           echo "Адрес воркера: $WORKER_URL"
-          curl -sS --fail "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook" --data-urlencode "url=${WORKER_URL}"
+          SECRET=$(printf %s "$TELEGRAM_TOKEN" | sha256sum | cut -c1-48)
+          curl -sS --fail "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook" \
+            --data-urlencode "url=${WORKER_URL}" \
+            --data-urlencode "secret_token=${SECRET}"
           echo
