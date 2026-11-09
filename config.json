@@ -1,12 +1,8 @@
-{
-  "alerts": [
-    { "coin": "BTC", "when": "above", "price": 80300 },
-    { "coin": "BTC", "when": "above", "price": 85000 },
-    { "coin": "BTC", "when": "above", "price": 90000 },
-    { "coin": "BTC", "when": "below", "price": 85000 },
-    { "coin": "BTC", "when": "below", "price": 80300 },
-    { "coin": "BTC", "when": "below", "price": 78000 },
-    { "coin": "BTC", "when": "below", "price": 70000 },
-    { "coin": "ETH", "when": "below", "price": 2000 }
-  ]
-}
+BTC выше 80300
+BTC выше 85000
+BTC выше 90000
+BTC ниже 85000
+BTC ниже 80300
+BTC ниже 78000
+BTC ниже 70000
+ETH ниже 2000
