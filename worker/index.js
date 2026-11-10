@@ -14,6 +14,7 @@ const MENU_COINS = ["BTC", "ETH", "SOL"];
 
 const DEFAULT_PRICE_BASE = "https://api.coinbase.com";
 const DEFAULT_STATS_BASE = "https://api.exchange.coinbase.com";
+const DEFAULT_CHART_BASE = "https://quickchart.io";
 const MOVE_REARM = 0.8; // скачок снова «включается», когда изменение упало ниже 80% порога
 const DEFAULT_TG_BASE = "https://api.telegram.org";
 
@@ -21,6 +22,7 @@ const KEYBOARD = {
   keyboard: [
     [{ text: "Цена BTC" }, { text: "Цена ETH" }],
     [{ text: "Все цены" }, { text: "Мои уровни" }],
+    [{ text: "График BTC" }, { text: "График ETH" }],
     [{ text: "Добавить уровень" }],
   ],
   resize_keyboard: true,
@@ -37,6 +39,7 @@ const HELP =
   "BTC +5%  (вырос на 5% за 24 часа)\n" +
   "ETH -5%  (упал на 5% за 24 часа)\n" +
   "SOL ±7%  (в любую сторону)\n\n" +
+  "Графики: кнопки «График BTC» и «График ETH». Для другой монеты и периода напиши, например: график SOL 7д.\n\n" +
   "Кнопки внизу: цена BTC и ETH, все цены, твои уровни. Чтобы удалить уровень, открой «Мои уровни» и нажми «Удалить».\n\n" +
   "Монеты: " + COINS.join(", ") + ". Максимум " + MAX_ALERTS + " уровней на человека.";
 
@@ -175,9 +178,17 @@ async function tg(env, method, body) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-    return { ok: r.ok, status: r.status };
+    let desc = "";
+    if (!r.ok) {
+      try {
+        desc = String((await r.json()).description || "");
+      } catch (e) {
+        // тела ответа может не быть
+      }
+    }
+    return { ok: r.ok, status: r.status, desc: desc };
   } catch (e) {
-    return { ok: false, status: 0 };
+    return { ok: false, status: 0, desc: "" };
   }
 }
 
@@ -197,12 +208,343 @@ export async function webhookSecret(token) {
   return (await sha256Hex(String(token))).slice(0, 48);
 }
 
+// ---------- Графики ----------
+
+const RANGES = {
+  "24h": { label: "24 часа", short: "24ч", span: 86400, gran: 900 },
+  "7d": { label: "7 дней", short: "7д", span: 7 * 86400, gran: 3600 },
+  "30d": { label: "30 дней", short: "30д", span: 30 * 86400, gran: 21600 },
+  "90d": { label: "90 дней", short: "90д", span: 90 * 86400, gran: 86400 },
+};
+const RANGE_ALIASES = {
+  "24ч": "24h", "24h": "24h", "1д": "24h", "1d": "24h", "сутки": "24h", "день": "24h",
+  "7д": "7d", "7d": "7d", "неделя": "7d",
+  "30д": "30d", "30d": "30d", "месяц": "30d",
+  "90д": "90d", "90d": "90d",
+};
+const CHART_HELP =
+  "Графики: нажми «График BTC» или «График ETH». Для другой монеты и периода напиши, например:\n" +
+  "график SOL 7д\n\nПериоды: 24ч, 7д, 30д, 90д.";
+
+export function parseRange(s) {
+  return RANGE_ALIASES[String(s).toLowerCase()] || null;
+}
+
+// «График BTC», «график sol 7д», «/chart ETH 30d». Если период непонятен, range будет null.
+export function parseChartRequest(text) {
+  const m = /^(?:\/chart(?:@\w+)?|график)\s+([a-z]{2,6})(?:\s+(\S+))?\s*$/i.exec(String(text).trim());
+  if (!m) return null;
+  const coin = m[1].toUpperCase();
+  if (!m[2]) return { coin: coin, range: "24h" };
+  return { coin: coin, range: parseRange(m[2]) };
+}
+
+// Свечи Coinbase: [время, мин, макс, открытие, закрытие, объём], новые первыми.
+export async function getCandles(env, coin, rangeKey) {
+  const r = RANGES[rangeKey];
+  const base = env.STATS_BASE || DEFAULT_STATS_BASE;
+  const end = Math.floor(Date.now() / 1000);
+  const iso = (sec) => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const url =
+    base + "/products/" + coin + "-USD/candles?granularity=" + r.gran + "&start=" + iso(end - r.span) + "&end=" + iso(end);
+  const res = await fetch(url, { headers: { "user-agent": "coin-pulse-bot", accept: "application/json" } });
+  if (!res.ok) throw new Error("candles " + coin + " " + res.status);
+  const rows = await res.json();
+  if (!Array.isArray(rows)) throw new Error("bad candles " + coin);
+  const pts = rows
+    .map((c) => ({ t: Number(c[0]) * 1000, p: Number(c[4]) }))
+    .filter((x) => x.t > 0 && x.p > 0)
+    .sort((a, b) => a.t - b.t);
+  if (pts.length < 2) throw new Error("few candles " + coin);
+  return pts;
+}
+
+export function chartSummary(coin, rangeKey, pts) {
+  const first = pts[0].p;
+  const last = pts[pts.length - 1].p;
+  let min = Infinity;
+  let max = -Infinity;
+  for (const x of pts) {
+    if (x.p < min) min = x.p;
+    if (x.p > max) max = x.p;
+  }
+  const change = ((last - first) / first) * 100;
+  const caption =
+    coin + " за " + RANGES[rangeKey].label + ": " + usd(last) + " (" + (change >= 0 ? "+" : "") + change.toFixed(1) + "%)\n" +
+    "Мин " + usd(min) + " · Макс " + usd(max);
+  return { first: first, last: last, min: min, max: max, change: change, caption: caption };
+}
+
+const pad2 = (n) => String(n).padStart(2, "0");
+function labelFor(t, rangeKey) {
+  const d = new Date(t);
+  if (rangeKey === "24h") return pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
+  return pad2(d.getUTCDate()) + "." + pad2(d.getUTCMonth() + 1);
+}
+
+// Описание картинки для quickchart.io (Chart.js 4).
+export function chartConfig(coin, rangeKey, pts, info) {
+  const title =
+    coin + " · " + RANGES[rangeKey].label + " · " + usd(info.last) + " (" + (info.change >= 0 ? "+" : "") + info.change.toFixed(1) + "%)";
+  const axis = { ticks: { color: "#93a4b3" }, grid: { color: "#2a3945" } };
+  return {
+    version: "4",
+    backgroundColor: "#0f171e",
+    width: 800,
+    height: 420,
+    format: "png",
+    chart: {
+      type: "line",
+      data: {
+        labels: pts.map((x) => labelFor(x.t, rangeKey)),
+        datasets: [
+          {
+            data: pts.map((x) => x.p),
+            borderColor: "#4fc3bd",
+            backgroundColor: "rgba(79,195,189,0.15)",
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: true,
+            tension: 0.2,
+          },
+        ],
+      },
+      options: {
+        color: "#e6edf2",
+        plugins: {
+          legend: { display: false },
+          title: { display: true, text: title, color: "#e6edf2", font: { size: 18 } },
+        },
+        scales: {
+          x: {
+            ticks: { color: "#93a4b3", maxTicksLimit: 7, maxRotation: 0 },
+            grid: { color: "#2a3945" },
+            title: rangeKey === "24h" ? { display: true, text: "время UTC", color: "#93a4b3" } : { display: false },
+          },
+          y: axis,
+        },
+      },
+    },
+  };
+}
+
+async function makeChartImage(env, coin, rangeKey, pts, info) {
+  const base = env.CHART_BASE || DEFAULT_CHART_BASE;
+  const r = await fetch(base + "/chart/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(chartConfig(coin, rangeKey, pts, info)),
+  });
+  if (!r.ok) throw new Error("chart " + r.status);
+  const j = await r.json();
+  if (!j || !j.success || !j.url) throw new Error("chart bad answer");
+  return j.url;
+}
+
+export function chartLink(origin, coin, rangeKey) {
+  return origin + "/chart?coin=" + coin + "&range=" + rangeKey;
+}
+
+export function chartMarkup(coin, rangeKey, origin) {
+  const rows = [
+    Object.keys(RANGES).map((k) => ({
+      text: (k === rangeKey ? "• " : "") + RANGES[k].short,
+      callback_data: "c:" + coin + ":" + k,
+    })),
+  ];
+  if (origin) rows.push([{ text: "Подробный график", url: chartLink(origin, coin, rangeKey) }]);
+  return { inline_keyboard: rows };
+}
+
+// ---------- Страница с графиком (открывается по ссылке) ----------
+
+const PAGE = String.raw`<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#eef1f4;--surface:#fff;--fg:#14202b;--muted:#566878;--line:#d3dbe2;--accent:#0b6e6e;--up:#17803d;--down:#c0392b;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0f171e;--surface:#17222b;--fg:#e6edf2;--muted:#93a4b3;--line:#2a3945;--accent:#4fc3bd;--up:#4cc47a;--down:#ff7a6b;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px max(16px,env(safe-area-inset-right)) 40px max(16px,env(safe-area-inset-left))}
+main{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+nav{display:flex;flex-wrap:wrap;gap:8px}
+nav a{color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:4px;padding:5px 12px;font-size:.9rem}
+nav a.on{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+nav a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.head{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 16px}
+.coin{font-size:1.4rem;font-weight:700}
+.price{font:600 2rem/1.1 ui-monospace,"SF Mono",Menlo,monospace;font-variant-numeric:tabular-nums}
+.chg{font:500 1.05rem ui-monospace,Menlo,monospace}
+.up{color:var(--up)}.down{color:var(--down)}
+#chart{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:8px;touch-action:pan-y}
+svg{display:block;width:100%}
+.line{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round}
+.area{fill:var(--accent);opacity:.12}
+.grid{stroke:var(--line);stroke-width:1}
+.lbl{fill:var(--muted);font:11px ui-monospace,Menlo,monospace}
+.cross{stroke:var(--muted);stroke-dasharray:3 3}
+.dot{fill:var(--accent);stroke:var(--surface);stroke-width:2}
+#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:4px 8px;font-size:.8rem;white-space:nowrap}
+#tip b{font-family:ui-monospace,Menlo,monospace}
+.foot{color:var(--muted);font-size:.82rem;margin:0;max-width:65ch}
+</style></head><body><main>
+<nav aria-label="Монета">__COINS__</nav>
+<div class="head"><span class="coin">__COIN__</span><span class="price" id="price"></span><span class="chg" id="chg"></span></div>
+<nav aria-label="Период">__RANGES__</nav>
+<div id="chart"><svg id="svg" role="img" aria-label="График цены __COIN__ за __LABEL__"></svg><div id="tip" hidden></div></div>
+<p class="foot">Данные Coinbase, время в часовом поясе твоего устройства. Это не финансовый совет.</p>
+</main>
+<script>
+(function () {
+  var D = __DATA__;
+  var RANGE = "__RANGE__";
+  var svg = document.getElementById("svg");
+  var tip = document.getElementById("tip");
+  var box = document.getElementById("chart");
+  var NS = "http://www.w3.org/2000/svg";
+  function fmt(n) {
+    var d = n >= 1 ? 2 : 4;
+    return "$" + n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function axisFmt(n) {
+    if (n >= 100) return "$" + Math.round(n).toLocaleString("en-US");
+    return fmt(n);
+  }
+  function el(name, attrs) {
+    var e = document.createElementNS(NS, name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function xLabel(t) {
+    var d = new Date(t);
+    return RANGE === "24h"
+      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString([], { day: "numeric", month: "short" });
+  }
+  var first = D[0][1], last = D[D.length - 1][1], ch = ((last - first) / first) * 100;
+  document.getElementById("price").textContent = fmt(last);
+  var c = document.getElementById("chg");
+  c.textContent = (ch >= 0 ? "+" : "") + ch.toFixed(2) + "% за период";
+  c.className = "chg " + (ch >= 0 ? "up" : "down");
+
+  var geo = null;
+  function draw() {
+    var W = Math.max(280, box.clientWidth - 16);
+    var H = Math.max(240, Math.min(400, Math.round(W * 0.55)));
+    var L = 76, R = 12, T = 12, B = 26;
+    var lo = Infinity, hi = -Infinity, i;
+    for (i = 0; i < D.length; i++) { if (D[i][1] < lo) lo = D[i][1]; if (D[i][1] > hi) hi = D[i][1]; }
+    var padv = (hi - lo) * 0.08 || hi * 0.01;
+    lo -= padv; hi += padv;
+    var t0 = D[0][0], t1 = D[D.length - 1][0];
+    function X(t) { return L + ((t - t0) / (t1 - t0)) * (W - L - R); }
+    function Y(p) { return T + (1 - (p - lo) / (hi - lo)) * (H - T - B); }
+    geo = { X: X, Y: Y, W: W, H: H, L: L, R: R };
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("height", H);
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    for (i = 0; i <= 4; i++) {
+      var v = lo + ((hi - lo) * i) / 4, y = Y(v);
+      svg.appendChild(el("line", { x1: L, x2: W - R, y1: y, y2: y, "class": "grid" }));
+      var tl = el("text", { x: L - 8, y: y + 4, "text-anchor": "end", "class": "lbl" });
+      tl.textContent = axisFmt(v);
+      svg.appendChild(tl);
+    }
+    for (i = 0; i <= 4; i++) {
+      var tt = t0 + ((t1 - t0) * i) / 4;
+      var xl = el("text", { x: X(tt), y: H - 6, "text-anchor": i === 0 ? "start" : (i === 4 ? "end" : "middle"), "class": "lbl" });
+      xl.textContent = xLabel(tt);
+      svg.appendChild(xl);
+    }
+    var d = "";
+    for (i = 0; i < D.length; i++) d += (i ? "L" : "M") + X(D[i][0]).toFixed(1) + " " + Y(D[i][1]).toFixed(1);
+    svg.appendChild(el("path", { d: d + "L" + X(t1).toFixed(1) + " " + (H - B) + "L" + X(t0).toFixed(1) + " " + (H - B) + "Z", "class": "area" }));
+    svg.appendChild(el("path", { d: d, "class": "line" }));
+  }
+  var cross = null, dot = null;
+  function hover(ev) {
+    var r = svg.getBoundingClientRect();
+    var x = ((ev.clientX - r.left) / r.width) * geo.W;
+    var best = 0, bd = Infinity, i;
+    for (i = 0; i < D.length; i++) { var dd = Math.abs(geo.X(D[i][0]) - x); if (dd < bd) { bd = dd; best = i; } }
+    var px = geo.X(D[best][0]), py = geo.Y(D[best][1]);
+    if (!cross) {
+      cross = el("line", { "class": "cross" });
+      dot = el("circle", { r: 4, "class": "dot" });
+      svg.appendChild(cross); svg.appendChild(dot);
+    }
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px);
+    cross.setAttribute("y1", 12); cross.setAttribute("y2", geo.H - 26);
+    dot.setAttribute("cx", px); dot.setAttribute("cy", py);
+    tip.hidden = false;
+    tip.innerHTML = "<b></b><br><span></span>";
+    tip.firstChild.textContent = fmt(D[best][1]);
+    tip.lastChild.textContent = new Date(D[best][0]).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    var left = (px / geo.W) * r.width + 8 + 8;
+    if (left > r.width - 130) left -= 150;
+    tip.style.left = left + "px";
+    tip.style.top = "16px";
+  }
+  function leave() {
+    tip.hidden = true;
+    if (cross) { svg.removeChild(cross); svg.removeChild(dot); cross = null; dot = null; }
+  }
+  svg.addEventListener("pointermove", hover);
+  svg.addEventListener("pointerleave", leave);
+  var timer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(timer);
+    timer = setTimeout(function () { leave(); draw(); }, 100);
+  });
+  draw();
+})();
+</script></body></html>`;
+
+function pageNav(items, current, hrefFor) {
+  return items
+    .map((it) => '<a href="' + hrefFor(it.key) + '"' + (it.key === current ? ' class="on" aria-current="page"' : "") + ">" + it.text + "</a>")
+    .join("");
+}
+
+export function chartHtml(coin, rangeKey, pts) {
+  const data = JSON.stringify(pts.map((x) => [x.t, x.p])).replace(/</g, "\\u003c");
+  const info = chartSummary(coin, rangeKey, pts);
+  return PAGE.replace("__TITLE__", coin + " " + usd(info.last))
+    .replace("__COINS__", pageNav(COINS.map((c) => ({ key: c, text: c })), coin, (c) => "?coin=" + c + "&range=" + rangeKey))
+    .replace(
+      "__RANGES__",
+      pageNav(Object.keys(RANGES).map((k) => ({ key: k, text: RANGES[k].short })), rangeKey, (k) => "?coin=" + coin + "&range=" + k)
+    )
+    .split("__COIN__").join(coin)
+    .replace("__LABEL__", RANGES[rangeKey].label)
+    .replace("__RANGE__", rangeKey)
+    .replace("__DATA__", () => data);
+}
+
+async function chartPageResponse(env, url) {
+  const coin = String(url.searchParams.get("coin") || "BTC").toUpperCase();
+  const rangeKey = RANGES[url.searchParams.get("range")] ? url.searchParams.get("range") : "24h";
+  const text = { "content-type": "text/plain; charset=utf-8" };
+  if (!COINS.includes(coin)) return new Response("Такой монеты нет. Доступны: " + COINS.join(", "), { status: 404, headers: text });
+  let pts;
+  try {
+    pts = await getCandles(env, coin, rangeKey);
+  } catch (e) {
+    return new Response("Не получилось получить данные. Обнови страницу через минуту.", { status: 502, headers: text });
+  }
+  return new Response(chartHtml(coin, rangeKey, pts), {
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
 // ---------- Следилка и хранилище (Durable Object) ----------
 
 export class Watcher {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.origin = null; // адрес воркера, нужен для ссылки на график
     this.users = null; // { chatId: { alerts: [{id, coin, when, price, fired}], nextId, fails } }
   }
 
@@ -228,6 +570,8 @@ export class Watcher {
       } catch (e) {
         return new Response("ok");
       }
+      const origin = request.headers.get("x-public-url");
+      if (origin) this.origin = origin;
       try {
         await this.handleUpdate(update);
       } catch (e) {
@@ -347,6 +691,13 @@ export class Watcher {
       await this.save();
     }
 
+    const cr = parseChartRequest(msg.text);
+    if (cr) {
+      if (cr.range === null) await sendMessage(this.env, chatId, "Не знаю такой период. Доступны: 24ч, 7д, 30д, 90д.", KEYBOARD);
+      else await this.sendChart(chatId, cr.coin, cr.range, null);
+      return;
+    }
+
     let reply;
     try {
       reply = await this.answer(chatId, msg.text);
@@ -370,6 +721,7 @@ export class Watcher {
     }
     if (low === "мои уровни" || cmd === "/list") return this.listReply(chatId);
     if (low === "добавить уровень") return { text: ADD_HELP };
+    if (low === "график" || cmd === "/chart") return { text: CHART_HELP };
     if (cmd === "/clear") {
       this.users[chatId].alerts = [];
       await this.save();
@@ -451,11 +803,54 @@ export class Watcher {
     return { text: out.join("\n") };
   }
 
+  async sendChart(chatId, coin, rangeKey, messageId) {
+    if (!COINS.includes(coin)) {
+      await sendMessage(this.env, chatId, coin + ": такой монеты нет. Доступны: " + COINS.join(", ") + ".", KEYBOARD);
+      return;
+    }
+    let pts;
+    try {
+      pts = await getCandles(this.env, coin, rangeKey);
+    } catch (e) {
+      await sendMessage(this.env, chatId, "Не получилось получить данные для графика. Попробуй ещё раз через минуту.", KEYBOARD);
+      return;
+    }
+    const info = chartSummary(coin, rangeKey, pts);
+    const markup = chartMarkup(coin, rangeKey, this.origin);
+    let url = null;
+    try {
+      url = await makeChartImage(this.env, coin, rangeKey, pts, info);
+    } catch (e) {
+      // ниже отправим текст со ссылкой
+    }
+    if (!url) {
+      let text = info.caption;
+      if (this.origin) text += "\n\nГрафик: " + chartLink(this.origin, coin, rangeKey);
+      await sendMessage(this.env, chatId, text, markup);
+      return;
+    }
+    if (messageId) {
+      const r = await tg(this.env, "editMessageMedia", {
+        chat_id: chatId,
+        message_id: messageId,
+        media: { type: "photo", media: url, caption: info.caption },
+        reply_markup: markup,
+      });
+      if (r.ok || r.desc.includes("not modified")) return;
+    }
+    await tg(this.env, "sendPhoto", { chat_id: chatId, photo: url, caption: info.caption, reply_markup: markup });
+  }
+
   async handleCallback(cb) {
     await tg(this.env, "answerCallbackQuery", { callback_query_id: cb.id });
     const chat = cb.message && cb.message.chat;
     if (!chat) return;
     const chatId = String(chat.id);
+    const cm = /^c:([A-Z]{2,6}):(24h|7d|30d|90d)$/.exec(cb.data || "");
+    if (cm) {
+      await this.sendChart(chatId, cm[1], cm[2], cb.message.message_id);
+      return;
+    }
     const users = await this.load();
     const user = users[chatId];
     const m = /^d:(\d+)$/.exec(cb.data || "");
@@ -483,6 +878,8 @@ function watcher(env) {
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
+      const url = new URL(request.url);
+      if (url.pathname === "/chart") return chartPageResponse(env, url);
       await watcher(env).fetch("https://watcher/ensure");
       return new Response("Бот работает");
     }
@@ -492,7 +889,11 @@ export default {
 
     const body = await request.text();
     try {
-      await watcher(env).fetch("https://watcher/update", { method: "POST", body: body });
+      await watcher(env).fetch("https://watcher/update", {
+        method: "POST",
+        body: body,
+        headers: { "x-public-url": new URL(request.url).origin },
+      });
     } catch (e) {
       console.log("forward failed: " + String(e));
     }
