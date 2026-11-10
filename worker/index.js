@@ -239,24 +239,50 @@ export function parseChartRequest(text) {
   return { coin: coin, range: parseRange(m[2]) };
 }
 
-// Свечи Coinbase: [время, мин, макс, открытие, закрытие, объём], новые первыми.
-export async function getCandles(env, coin, rangeKey) {
-  const r = RANGES[rangeKey];
+// Свечи Coinbase. Сначала биржевой источник, если он не отвечает, публичный запасной.
+const BROKERAGE_GRAN = { 900: "FIFTEEN_MINUTE", 3600: "ONE_HOUR", 21600: "SIX_HOUR", 86400: "ONE_DAY" };
+
+async function candlesExchange(env, coin, r, end) {
   const base = env.STATS_BASE || DEFAULT_STATS_BASE;
-  const end = Math.floor(Date.now() / 1000);
   const iso = (sec) => new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
   const url =
     base + "/products/" + coin + "-USD/candles?granularity=" + r.gran + "&start=" + iso(end - r.span) + "&end=" + iso(end);
   const res = await fetch(url, { headers: { "user-agent": "coin-pulse-bot", accept: "application/json" } });
-  if (!res.ok) throw new Error("candles " + coin + " " + res.status);
+  if (!res.ok) throw new Error("exchange " + res.status);
   const rows = await res.json();
-  if (!Array.isArray(rows)) throw new Error("bad candles " + coin);
-  const pts = rows
-    .map((c) => ({ t: Number(c[0]) * 1000, p: Number(c[4]) }))
-    .filter((x) => x.t > 0 && x.p > 0)
-    .sort((a, b) => a.t - b.t);
-  if (pts.length < 2) throw new Error("few candles " + coin);
-  return pts;
+  if (!Array.isArray(rows)) throw new Error("exchange bad answer");
+  // строки: [время, мин, макс, открытие, закрытие, объём]
+  return rows.map((c) => ({ t: Number(c[0]) * 1000, p: Number(c[4]) }));
+}
+
+async function candlesBrokerage(env, coin, r, end) {
+  const base = env.PRICE_BASE || DEFAULT_PRICE_BASE;
+  const url =
+    base + "/api/v3/brokerage/market/products/" + coin + "-USD/candles?granularity=" + BROKERAGE_GRAN[r.gran] +
+    "&start=" + (end - r.span) + "&end=" + end;
+  const res = await fetch(url, { headers: { "user-agent": "coin-pulse-bot", accept: "application/json" } });
+  if (!res.ok) throw new Error("brokerage " + res.status);
+  const j = await res.json();
+  if (!j || !Array.isArray(j.candles)) throw new Error("brokerage bad answer");
+  return j.candles.map((c) => ({ t: Number(c.start) * 1000, p: Number(c.close) }));
+}
+
+export async function getCandles(env, coin, rangeKey) {
+  const r = RANGES[rangeKey];
+  const end = Math.floor(Date.now() / 1000);
+  const errors = [];
+  for (const source of [candlesExchange, candlesBrokerage]) {
+    try {
+      const pts = (await source(env, coin, r, end))
+        .filter((x) => x.t > 0 && x.p > 0)
+        .sort((a, b) => a.t - b.t);
+      if (pts.length >= 2) return pts;
+      errors.push("мало точек");
+    } catch (e) {
+      errors.push(String(e && e.message ? e.message : e));
+    }
+  }
+  throw new Error("candles " + coin + ": " + errors.join("; "));
 }
 
 export function chartSummary(coin, rangeKey, pts) {
@@ -812,7 +838,7 @@ export class Watcher {
     try {
       pts = await getCandles(this.env, coin, rangeKey);
     } catch (e) {
-      await sendMessage(this.env, chatId, "Не получилось получить данные для графика. Попробуй ещё раз через минуту.", KEYBOARD);
+      await sendMessage(this.env, chatId, "Не получилось получить данные для графика. Попробуй ещё раз через минуту.\n(" + String(e && e.message ? e.message : e).slice(0, 150) + ")", KEYBOARD);
       return;
     }
     const info = chartSummary(coin, rangeKey, pts);
