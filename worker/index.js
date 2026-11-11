@@ -15,6 +15,7 @@ const MENU_COINS = ["BTC", "ETH", "SOL"];
 const DEFAULT_PRICE_BASE = "https://api.coinbase.com";
 const DEFAULT_STATS_BASE = "https://api.exchange.coinbase.com";
 const DEFAULT_CHART_BASE = "https://quickchart.io";
+const DEFAULT_FNG_BASE = "https://api.alternative.me";
 const MOVE_REARM = 0.8; // скачок снова «включается», когда изменение упало ниже 80% порога
 const DEFAULT_TG_BASE = "https://api.telegram.org";
 
@@ -23,7 +24,8 @@ const KEYBOARD = {
     [{ text: "Цена BTC" }, { text: "Цена ETH" }],
     [{ text: "Все цены" }, { text: "Мои уровни" }],
     [{ text: "График BTC" }, { text: "График ETH" }],
-    [{ text: "Портфель" }, { text: "Добавить уровень" }],
+    [{ text: "Портфель" }, { text: "Страх и жадность" }],
+    [{ text: "Добавить уровень" }],
   ],
   resize_keyboard: true,
   is_persistent: true,
@@ -52,6 +54,7 @@ const HELP =
   "SOL ±7%  (в любую сторону)\n\n" +
   "Графики: кнопки «График BTC» и «График ETH». Для другой монеты и периода напиши, например: график SOL 7д.\n\n" +
   PORTFOLIO_SHORT + "\n\n" +
+  "Кнопка «Страх и жадность» показывает настроение рынка за сегодня числом от 0 до 100.\n\n" +
   "Кнопки внизу: цена BTC и ETH, все цены, твои уровни. Чтобы удалить уровень, открой «Мои уровни» и нажми «Удалить».\n\n" +
   "Монеты: " + COINS.join(", ") + ". Максимум " + MAX_ALERTS + " уровней на человека.";
 
@@ -636,6 +639,43 @@ export function applyTrade(positions, t) {
   return "• Продал " + qtyText(t.qty) + " " + t.coin + ". Осталось " + qtyText(pos.qty) + " " + t.coin + ", средняя цена прежняя " + usd(pos.cost / pos.qty) + ".";
 }
 
+// ---------- Индекс страха и жадности ----------
+
+// Число от 0 (все боятся) до 100 (все жадничают). Источник: alternative.me, бесплатно и без ключа.
+export function fearLevel(v) {
+  if (v < 25) return { name: "Крайний страх", mark: "🔴" };
+  if (v < 45) return { name: "Страх", mark: "🟠" };
+  if (v <= 55) return { name: "Нейтрально", mark: "🟡" };
+  if (v <= 74) return { name: "Жадность", mark: "🟢" };
+  return { name: "Крайняя жадность", mark: "🟢" };
+}
+
+export async function getFear(env) {
+  const base = env.FNG_BASE || DEFAULT_FNG_BASE;
+  const res = await fetch(base + "/fng/?limit=31&format=json", { headers: { "user-agent": "coin-pulse-bot", accept: "application/json" } });
+  if (!res.ok) throw new Error("fng " + res.status);
+  const j = await res.json();
+  const rows = j && Array.isArray(j.data) ? j.data : [];
+  // новые записи первыми; берём только настоящие числа от 0 до 100
+  const vals = rows.map((r) => Number(r && r.value)).filter((v) => Number.isFinite(v) && v >= 0 && v <= 100);
+  if (!vals.length) throw new Error("fng bad answer");
+  return vals;
+}
+
+export function fearText(vals) {
+  const now = vals[0];
+  const lvl = fearLevel(now);
+  const filled = Math.round(now / 10);
+  const bar = "█".repeat(filled) + "░".repeat(10 - filled);
+  const lines = [lvl.mark + " Индекс страха и жадности: " + now + " из 100", lvl.name, bar, ""];
+  const past = [["Вчера", 1], ["Неделю назад", 7], ["Месяц назад", 30]];
+  for (const [label, i] of past) {
+    if (vals[i] !== undefined) lines.push(label + ": " + vals[i] + " (" + fearLevel(vals[i]).name.toLowerCase() + ")");
+  }
+  lines.push("", "0 значит все боятся и продают, 100 значит все жадничают и покупают. Это настроение рынка, а не совет покупать или продавать.");
+  return lines.join("\n");
+}
+
 // ---------- Следилка и хранилище (Durable Object) ----------
 
 export class Watcher {
@@ -820,6 +860,7 @@ export class Watcher {
     if (low === "мои уровни" || cmd === "/list") return this.listReply(chatId);
     if (low === "добавить уровень") return { text: ADD_HELP };
     if (low === "портфель" || cmd === "/portfolio") return this.portfolioReply(chatId);
+    if (low === "страх и жадность" || low === "индекс страха" || cmd === "/fear") return { text: fearText(await getFear(this.env)) };
     if (parsePortfolioLine(t.split("\n")[0])) return this.portfolioTrade(chatId, t);
     if (low === "график" || cmd === "/chart") return { text: CHART_HELP };
     if (cmd === "/clear") {
