@@ -23,11 +23,22 @@ const KEYBOARD = {
     [{ text: "Цена BTC" }, { text: "Цена ETH" }],
     [{ text: "Все цены" }, { text: "Мои уровни" }],
     [{ text: "График BTC" }, { text: "График ETH" }],
-    [{ text: "Добавить уровень" }],
+    [{ text: "Портфель" }, { text: "Добавить уровень" }],
   ],
   resize_keyboard: true,
   is_persistent: true,
 };
+
+const PORTFOLIO_SHORT =
+  "Портфель: запиши покупку, например: купил 0.1 BTC по 70000. Кнопка «Портфель» покажет, сколько ты в плюсе или в минусе.";
+
+const PORTFOLIO_HELP =
+  "Портфель считает твою прибыль и убыток. Запиши покупку сообщением:\n" +
+  "купил 0.1 BTC по 70000\n" +
+  "купил 2 ETH по 2300\n\n" +
+  "Цену и количество пиши без пробелов (можно 70k). Если докупаешь ту же монету, бот сам посчитает среднюю цену.\n\n" +
+  "Продажа: продал 0.05 BTC. Убрать монету целиком: убрать BTC.\n" +
+  "Потом нажми «Портфель».";
 
 const HELP =
   "Я слежу за ценой крипты и пишу тебе, когда цена дойдёт до твоего уровня.\n\n" +
@@ -40,6 +51,7 @@ const HELP =
   "ETH -5%  (упал на 5% за 24 часа)\n" +
   "SOL ±7%  (в любую сторону)\n\n" +
   "Графики: кнопки «График BTC» и «График ETH». Для другой монеты и периода напиши, например: график SOL 7д.\n\n" +
+  PORTFOLIO_SHORT + "\n\n" +
   "Кнопки внизу: цена BTC и ETH, все цены, твои уровни. Чтобы удалить уровень, открой «Мои уровни» и нажми «Удалить».\n\n" +
   "Монеты: " + COINS.join(", ") + ". Максимум " + MAX_ALERTS + " уровней на человека.";
 
@@ -67,10 +79,10 @@ export function describe(a) {
 export function alertText(a, price, change) {
   if (isMove(a)) {
     const verb = a.when === "up" ? "вырос на " : "упал на ";
-    return a.coin + " " + verb + Math.abs(change).toFixed(1) + "% за 24 часа. Сейчас " + usd(price) + ".";
+    return (a.when === "up" ? "🟢 " : "🔴 ") + a.coin + " " + verb + Math.abs(change).toFixed(1) + "% за 24 часа. Сейчас " + usd(price) + ".";
   }
   const verb = a.when === "above" ? "поднялся выше" : "упал ниже";
-  return a.coin + " " + verb + " " + usdShort(a.price) + ". Сейчас " + usd(price) + ".";
+  return (a.when === "above" ? "🟢 " : "🔴 ") + a.coin + " " + verb + " " + usdShort(a.price) + ". Сейчас " + usd(price) + ".";
 }
 
 // ---------- Разбор сообщений ----------
@@ -296,7 +308,7 @@ export function chartSummary(coin, rangeKey, pts) {
   }
   const change = ((last - first) / first) * 100;
   const caption =
-    coin + " за " + RANGES[rangeKey].label + ": " + usd(last) + " (" + (change >= 0 ? "+" : "") + change.toFixed(1) + "%)\n" +
+    (change >= 0 ? "🟢 " : "🔴 ") + coin + " за " + RANGES[rangeKey].label + ": " + usd(last) + " (" + (change >= 0 ? "+" : "") + change.toFixed(1) + "%)\n" +
     "Мин " + usd(min) + " · Макс " + usd(max);
   return { first: first, last: last, min: min, max: max, change: change, caption: caption };
 }
@@ -312,6 +324,8 @@ function labelFor(t, rangeKey) {
 export function chartConfig(coin, rangeKey, pts, info) {
   const title =
     coin + " · " + RANGES[rangeKey].label + " · " + usd(info.last) + " (" + (info.change >= 0 ? "+" : "") + info.change.toFixed(1) + "%)";
+  const line = info.change >= 0 ? "#3fb68b" : "#e5645f";
+  const fill = info.change >= 0 ? "rgba(63,182,139,0.15)" : "rgba(229,100,95,0.15)";
   const axis = { ticks: { color: "#93a4b3" }, grid: { color: "#2a3945" } };
   return {
     version: "4",
@@ -326,8 +340,8 @@ export function chartConfig(coin, rangeKey, pts, info) {
         datasets: [
           {
             data: pts.map((x) => x.p),
-            borderColor: "#4fc3bd",
-            backgroundColor: "rgba(79,195,189,0.15)",
+            borderColor: line,
+            backgroundColor: fill,
             borderWidth: 2,
             pointRadius: 0,
             fill: true,
@@ -564,6 +578,64 @@ async function chartPageResponse(env, url) {
   });
 }
 
+// ---------- Портфель ----------
+
+const BUY_WORDS = ["купил", "купила", "buy", "/buy"];
+const SELL_WORDS = ["продал", "продала", "sell", "/sell"];
+const DROP_WORDS = ["убрать", "убери", "удалить", "/drop"];
+const FILLER = ["по", "за", "at", "@", "цене", "по цене", "цена"];
+
+// «купил 0.1 BTC по 70000», «/buy BTC 0.1 70000», «продал 0.05 BTC», «убрать BTC».
+// Не про портфель: null. Непонятная строка про портфель: { error }.
+export function parsePortfolioLine(line) {
+  const tokens = String(line).trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const verb = tokens.shift();
+  const kind = BUY_WORDS.includes(verb) ? "buy" : SELL_WORDS.includes(verb) ? "sell" : DROP_WORDS.includes(verb) ? "drop" : null;
+  if (!kind) return null;
+  const rest = tokens.filter((t) => !FILLER.includes(t));
+  const coins = rest.filter((t) => /^[a-z]{2,6}$/.test(t));
+  const nums = rest.filter((t) => !/^[a-z]{2,6}$/.test(t)).map(parseNumber);
+  const bad = { error: "Не понял: «" + line.trim() + "». Пример: купил 0.1 BTC по 70000" };
+  if (coins.length !== 1 || nums.some((n) => n === null)) return bad;
+  const coin = coins[0].toUpperCase();
+  if (kind === "buy") return nums.length === 2 ? { kind: kind, coin: coin, qty: nums[0], price: nums[1] } : bad;
+  if (kind === "sell") {
+    if (nums.length < 1 || nums.length > 2) return { error: "Не понял: «" + line.trim() + "». Пример: продал 0.05 BTC" };
+    return { kind: kind, coin: coin, qty: nums[0] };
+  }
+  return nums.length === 0 ? { kind: kind, coin: coin } : { error: "Не понял: «" + line.trim() + "». Пример: убрать BTC" };
+}
+
+const round8 = (n) => Math.round(n * 1e8) / 1e8;
+const qtyText = (n) => Number(n).toLocaleString("en-US", { maximumFractionDigits: 8 });
+const signedUsd = (n) => (n < 0 ? "-" : "+") + (n === 0 ? "$0.00" : usd(Math.abs(n)));
+const signedPct = (n) => (n < 0 ? "" : "+") + n.toFixed(2) + "%";
+const cents = (n) => Math.round(n * 100) / 100;
+const mark = (n) => (n > 0 ? "🟢" : n < 0 ? "🔴" : "⚪");
+
+// Меняет список позиций user.positions: [{coin, qty, cost}], cost = сколько всего заплачено в долларах.
+export function applyTrade(positions, t) {
+  const i = positions.findIndex((p) => p.coin === t.coin);
+  const pos = i >= 0 ? positions[i] : null;
+  if (t.kind === "buy") {
+    if (pos) {
+      pos.qty = round8(pos.qty + t.qty);
+      pos.cost = pos.cost + t.qty * t.price;
+      return "• Докупил: " + qtyText(t.qty) + " " + t.coin + " по " + usd(t.price) + ". Всего " + qtyText(pos.qty) + " " + t.coin + ", средняя цена " + usd(pos.cost / pos.qty) + ".";
+    }
+    positions.push({ coin: t.coin, qty: round8(t.qty), cost: t.qty * t.price });
+    return "• Записал: " + qtyText(t.qty) + " " + t.coin + " по " + usd(t.price) + ".";
+  }
+  if (!pos) return "• " + t.coin + ": в портфеле такой монеты нет.";
+  if (t.kind === "drop" || t.qty >= pos.qty) {
+    positions.splice(i, 1);
+    return "• " + t.coin + " убрал из портфеля.";
+  }
+  pos.cost = pos.cost * ((pos.qty - t.qty) / pos.qty);
+  pos.qty = round8(pos.qty - t.qty);
+  return "• Продал " + qtyText(t.qty) + " " + t.coin + ". Осталось " + qtyText(pos.qty) + " " + t.coin + ", средняя цена прежняя " + usd(pos.cost / pos.qty) + ".";
+}
+
 // ---------- Следилка и хранилище (Durable Object) ----------
 
 export class Watcher {
@@ -747,6 +819,8 @@ export class Watcher {
     }
     if (low === "мои уровни" || cmd === "/list") return this.listReply(chatId);
     if (low === "добавить уровень") return { text: ADD_HELP };
+    if (low === "портфель" || cmd === "/portfolio") return this.portfolioReply(chatId);
+    if (parsePortfolioLine(t.split("\n")[0])) return this.portfolioTrade(chatId, t);
     if (low === "график" || cmd === "/chart") return { text: CHART_HELP };
     if (cmd === "/clear") {
       this.users[chatId].alerts = [];
@@ -764,16 +838,77 @@ export class Watcher {
     return this.addAlerts(chatId, t);
   }
 
+  async portfolioTrade(chatId, text) {
+    const user = this.users[chatId];
+    if (!user.positions) user.positions = [];
+    const out = [];
+    let changed = false;
+    for (const line of text.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      const t = parsePortfolioLine(line);
+      if (!t) continue;
+      if (t.error) {
+        out.push("• " + t.error);
+        continue;
+      }
+      if (!COINS.includes(t.coin)) {
+        out.push("• " + t.coin + ": такой монеты нет. Доступны: " + COINS.join(", ") + ".");
+        continue;
+      }
+      out.push(applyTrade(user.positions, t));
+      changed = true;
+    }
+    if (changed) await this.save();
+    return { text: out.join("\n") + "\n\nНажми «Портфель», чтобы увидеть прибыль." };
+  }
+
+  async portfolioReply(chatId, prefix) {
+    const positions = (this.users[chatId].positions || []).filter((p) => p.qty > 0);
+    if (!positions.length) return { text: (prefix || "") + PORTFOLIO_HELP };
+    const prices = await Promise.all(positions.map((p) => getPrice(this.env, p.coin).catch(() => null)));
+    const lines = ["💼 Твой портфель", ""];
+    let cost = 0;
+    let value = 0;
+    let missing = false;
+    positions.forEach((p, i) => {
+      const price = prices[i];
+      const avg = p.cost / p.qty;
+      if (!(price > 0)) {
+        missing = true;
+        lines.push("⚪ " + p.coin + ": " + qtyText(p.qty) + " по " + usd(avg) + ", цену сейчас получить не удалось", "");
+        return;
+      }
+      const now = p.qty * price;
+      const pl = cents(now - p.cost);
+      cost += p.cost;
+      value += now;
+      lines.push(
+        mark(pl) + " " + p.coin + ": " + qtyText(p.qty) + " по " + usd(avg),
+        "   Сейчас " + usd(price) + ", стоит " + usd(now),
+        "   " + signedUsd(pl) + " (" + signedPct(p.cost > 0 ? (pl / p.cost) * 100 : 0) + ")",
+        ""
+      );
+    });
+    if (cost > 0) {
+      const pl = cents(value - cost);
+      lines.push("Вложено " + usd(cost) + ", сейчас " + usd(value), mark(pl) + " Итого " + signedUsd(pl) + " (" + signedPct((pl / cost) * 100) + ")");
+    }
+    if (missing) lines.push("", "Монеты без цены в итог не вошли.");
+    const buttons = positions.map((p) => ({ text: "Убрать " + p.coin, callback_data: "p:" + p.coin }));
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
+    return { text: (prefix || "") + lines.join("\n"), markup: { inline_keyboard: rows } };
+  }
+
   listReply(chatId, prefix) {
     const alerts = this.users[chatId].alerts;
     if (!alerts.length) {
       return { text: (prefix || "") + "Уровней пока нет. Напиши, например: BTC выше 85000" };
     }
-    const lines = alerts.map((a, i) => i + 1 + ". " + describe(a) + (a.fired ? " (сработал)" : " (жду)"));
+    const lines = alerts.map((a, i) => i + 1 + ". " + describe(a) + (a.fired ? " ✅" : " ⏳"));
     const buttons = alerts.map((a, i) => ({ text: "Удалить " + (i + 1), callback_data: "d:" + a.id }));
     const rows = [];
     for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
-    return { text: (prefix || "") + "Твои уровни:\n" + lines.join("\n"), markup: { inline_keyboard: rows } };
+    return { text: (prefix || "") + "🔔 Твои уровни:\n" + lines.join("\n"), markup: { inline_keyboard: rows } };
   }
 
   async addAlerts(chatId, text) {
@@ -879,6 +1014,20 @@ export class Watcher {
     }
     const users = await this.load();
     const user = users[chatId];
+    const pm = /^p:([A-Z]{2,6})$/.exec(cb.data || "");
+    if (pm && user) {
+      const before = (user.positions || []).length;
+      user.positions = (user.positions || []).filter((p) => p.coin !== pm[1]);
+      if (user.positions.length !== before) await this.save();
+      const r = await this.portfolioReply(chatId);
+      await tg(this.env, "editMessageText", {
+        chat_id: chatId,
+        message_id: cb.message.message_id,
+        text: r.text,
+        reply_markup: r.markup || { inline_keyboard: [] },
+      });
+      return;
+    }
     const m = /^d:(\d+)$/.exec(cb.data || "");
     if (!user || !m) return;
     const id = Number(m[1]);
