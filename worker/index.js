@@ -676,6 +676,149 @@ export function fearText(vals) {
   return lines.join("\n");
 }
 
+// ---------- Канал: сводки, резкие движения, итоги недели ----------
+
+const CH_TZ = "Europe/Chisinau"; // по этому времени выходят утренняя сводка и итоги недели
+const DIGEST_HOUR = 9; // утренняя сводка в 9:00
+const WEEKLY_HOUR = 18; // итоги недели в воскресенье в 18:00
+const MOVE_CHECK_MS = 60000; // как часто искать резкие движения
+const MOVE_POST_PCT = 7; // порог для поста о движении, % за 24 часа (можно поменять в CHANNEL_MOVE_PCT)
+const MAX_MOVE_POSTS_PER_DAY = 6; // чтобы канал не превращался в спам
+const RETRY_MS = 60000; // через сколько повторять, если не получили данные
+
+const TIPS = [
+  { ru: "Сид-фраза кошелька это ключ ко всем деньгам. Никому её не показывай. Настоящая поддержка никогда не просит её.", en: "Your wallet's seed phrase is the key to all your money. Never show it to anyone. Real support never asks for it." },
+  { ru: "Храни сид-фразу на бумаге или металле в безопасном месте. Не фотографируй её и не клади в облако или заметки.", en: "Keep your seed phrase on paper or metal in a safe place. Do not photograph it or store it in the cloud or in notes." },
+  { ru: "Включи двухфакторную защиту через приложение-аутентификатор. СМС защищают хуже.", en: "Turn on two-factor protection with an authenticator app. Text messages protect worse." },
+  { ru: "Перед большим переводом отправь маленькую пробную сумму и убедись, что она дошла по нужному адресу.", en: "Before a large transfer, send a small test amount and make sure it arrives at the right address." },
+  { ru: "«Удвоим ваш вклад» и «гарантированная доходность» это мошенничество. Гарантий в крипте нет.", en: "\"We will double your deposit\" and \"guaranteed returns\" are scams. There are no guarantees in crypto." },
+  { ru: "Вкладывай только те деньги, потерю которых переживёшь. Цены в крипте сильно прыгают.", en: "Only invest money whose loss you can survive. Crypto prices swing a lot." },
+  { ru: "Если незнакомец сам написал тебе в личные сообщения с предложением помощи или заработка, это почти всегда мошенник.", en: "If a stranger messages you first offering help or easy profit, it is almost always a scammer." },
+  { ru: "Заходи на биржи и кошельки по сохранённой закладке, а не по рекламе в поиске. Подделки сайтов бывают очень похожи.", en: "Open exchanges and wallets from a saved bookmark, not from a search ad. Fake sites can look very similar." },
+  { ru: "Смотри на комиссию сети перед переводом. В часы большой нагрузки она бывает заметно выше.", en: "Check the network fee before a transfer. During busy hours it can be much higher." },
+  { ru: "Цена одной монеты ничего не говорит о размере проекта. Смотри на рыночную капитализацию: цена умножить на число монет.", en: "The price of a single coin says nothing about the size of a project. Look at market capitalization: price times the number of coins." },
+  { ru: "Не подписывай в кошельке незнакомые запросы вроде «доступ ко всем токенам». Они могут опустошить кошелёк.", en: "Do not sign unfamiliar wallet requests like \"access to all tokens\". They can empty your wallet." },
+  { ru: "Для долгого хранения многие используют аппаратный кошелёк. На бирже ключи хранит биржа, а не ты.", en: "For long-term storage many people use a hardware wallet. On an exchange, the exchange holds the keys, not you." },
+  { ru: "Покупка равными частями через равные промежутки времени снижает влияние неудачного момента входа. Прибыль это не гарантирует.", en: "Buying in equal parts at regular intervals reduces the effect of a badly timed entry. It does not guarantee profit." },
+  { ru: "Крипторынок работает круглосуточно и без выходных, поэтому резкие движения случаются и ночью. Уведомления в боте помогают их не пропустить.", en: "The crypto market runs around the clock, so sharp moves happen at night too. Alerts in the bot help you not miss them." },
+  { ru: "Заведи отдельную электронную почту для бирж и кошельков и защити её двухфакторной защитой.", en: "Use a separate email for exchanges and wallets and protect it with two-factor authentication." },
+  { ru: "В некоторых странах доход от крипты облагается налогом. Уточни правила у специалиста в своей стране.", en: "In some countries crypto income is taxable. Check the rules with a specialist in your country." },
+];
+
+export function localParts(ms, tz = CH_TZ) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", weekday: "short",
+  }).formatToParts(new Date(ms));
+  const g = (t) => parts.find((x) => x.type === t).value;
+  const dow = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[g("weekday")];
+  return { date: g("year") + "-" + g("month") + "-" + g("day"), hour: Number(g("hour")), dow: dow, y: Number(g("year")), m: Number(g("month")), d: Number(g("day")) };
+}
+
+export function tipOfDay(lp) {
+  const day = Math.floor(Date.UTC(lp.y, lp.m - 1, lp.d) / 86400000);
+  return TIPS[day % TIPS.length];
+}
+
+const FEAR_EN = ["Extreme fear", "Fear", "Neutral", "Greed", "Extreme greed"];
+const fearIdx = (v) => (v < 25 ? 0 : v < 45 ? 1 : v <= 55 ? 2 : v <= 74 ? 3 : 4);
+const ruDate = (lp) => String(lp.d).padStart(2, "0") + "." + String(lp.m).padStart(2, "0") + "." + lp.y;
+const DISCLAIMER = "Не финансовый совет · Not financial advice";
+
+export function digestText(rows, fearVal, lp) {
+  const lines = ["🌅 Утренняя сводка · Morning digest", ruDate(lp), ""];
+  for (const r of rows) {
+    lines.push(mark(cents(r.change)) + " " + r.coin + "  " + usd(r.price) + "  " + signedPct(r.change));
+  }
+  if (fearVal !== null && fearVal !== undefined) {
+    const i = fearIdx(fearVal);
+    lines.push("", fearLevel(fearVal).mark + " Страх и жадность · Fear & Greed: " + fearVal + "/100 (" + fearLevel(fearVal).name.toLowerCase() + " · " + FEAR_EN[i].toLowerCase() + ")");
+  }
+  const tip = tipOfDay(lp);
+  lines.push("", "💡 " + tip.ru, "💡 " + tip.en, "", DISCLAIMER);
+  return lines.join("\n");
+}
+
+export function weeklyText(rows, lp) {
+  const sorted = rows.slice().sort((a, b) => b.change - a.change);
+  const lines = ["📅 Итоги недели · Weekly recap", ruDate(lp), ""];
+  for (const r of sorted) lines.push(mark(cents(r.change)) + " " + r.coin + "  " + usd(r.price) + "  " + signedPct(r.change));
+  const best = sorted[0];
+  const worst = sorted[sorted.length - 1];
+  lines.push("", "🏆 Лучшая · Best: " + best.coin + " " + signedPct(best.change), "📉 Худшая · Worst: " + worst.coin + " " + signedPct(worst.change), "", "Изменение за 7 дней · Change over 7 days", DISCLAIMER);
+  return lines.join("\n");
+}
+
+export function moveText(coin, change, price) {
+  const up = change > 0;
+  return (up ? "🟢 " : "🔴 ") + coin + " " + signedPct(change) + " за 24 часа · in 24h\nСейчас · Now: " + usd(price);
+}
+
+async function loadAllStats(env) {
+  const out = await Promise.all(COINS.map(async (c) => {
+    try {
+      const s = await getStats(env, c);
+      return { coin: c, price: s.price, change: s.change };
+    } catch (e) {
+      return null;
+    }
+  }));
+  return out.filter(Boolean);
+}
+
+async function postToChannel(env, chatId, text, photoUrl, caption) {
+  if (photoUrl) await tg(env, "sendPhoto", { chat_id: chatId, photo: photoUrl, caption: caption });
+  return tg(env, "sendMessage", { chat_id: chatId, text: text, disable_web_page_preview: true });
+}
+
+async function btcChart(env, rangeKey, pts) {
+  const points = pts || (await getCandles(env, "BTC", rangeKey));
+  const info = chartSummary("BTC", rangeKey, points);
+  const url = await makeChartImage(env, "BTC", rangeKey, points, info);
+  const label = rangeKey === "24h" ? "24ч · 24h" : "7д · 7d";
+  return { url: url, caption: mark(cents(info.change)) + " BTC · " + label + " · " + usd(info.last) + " (" + signedPct(info.change) + ")" };
+}
+
+export async function sendDigest(env, chatId, now) {
+  const rows = await loadAllStats(env);
+  if (rows.length < 3) throw new Error("not enough data");
+  let fear = null;
+  try {
+    fear = (await getFear(env))[0];
+  } catch (e) {
+    // сводка выходит и без индекса
+  }
+  let chart = null;
+  try {
+    chart = await btcChart(env, "24h");
+  } catch (e) {
+    // и без картинки
+  }
+  return postToChannel(env, chatId, digestText(rows, fear, localParts(now)), chart && chart.url, chart && chart.caption);
+}
+
+export async function sendWeekly(env, chatId, now) {
+  const results = await Promise.all(COINS.map(async (c) => {
+    try {
+      const pts = await getCandles(env, c, "7d");
+      const first = pts[0].p;
+      const last = pts[pts.length - 1].p;
+      return { coin: c, price: last, change: ((last - first) / first) * 100, pts: pts };
+    } catch (e) {
+      return null;
+    }
+  }));
+  const rows = results.filter(Boolean);
+  if (rows.length < 3) throw new Error("not enough data");
+  let chart = null;
+  try {
+    const btc = rows.find((r) => r.coin === "BTC");
+    chart = await btcChart(env, "7d", btc && btc.pts);
+  } catch (e) {
+    // и без картинки
+  }
+  return postToChannel(env, chatId, weeklyText(rows, localParts(now)), chart && chart.url, chart && chart.caption);
+}
+
 // ---------- Следилка и хранилище (Durable Object) ----------
 
 export class Watcher {
@@ -683,6 +826,9 @@ export class Watcher {
     this.state = state;
     this.env = env;
     this.origin = null; // адрес воркера, нужен для ссылки на график
+    this.channel = undefined; // настройки канала (undefined: ещё не читали)
+    this.lastMoveCheck = 0;
+    this.retryAt = {};
     this.users = null; // { chatId: { alerts: [{id, coin, when, price, fired}], nextId, fails } }
   }
 
@@ -724,11 +870,159 @@ export class Watcher {
     return new Response("ok");
   }
 
+  // ----- канал -----
+
+  async loadChannel() {
+    if (this.channel === undefined) this.channel = (await this.state.storage.get("channel")) || null;
+    return this.channel;
+  }
+
+  async saveChannel() {
+    await this.state.storage.put("channel", this.channel);
+  }
+
+  // Если канал не принял сообщение насовсем (нет прав, канал удалён), выключаем и говорим владельцу.
+  async channelFailed(ch, r) {
+    if (r.ok) return false;
+    if (r.status === 400 || r.status === 403 || r.status === 404) {
+      ch.enabled = false;
+      await this.saveChannel();
+      await sendMessage(this.env, this.env.TELEGRAM_CHAT_ID, "Канал " + ch.id + " отключён: " + (r.desc || "Telegram не принял сообщение") + ". Проверь, что бот в администраторах канала с правом публиковать, и включи снова командой /channel on.");
+    }
+    return true;
+  }
+
+  // Возвращает true, если в этот раз выполнялась работа для канала (тогда обычную проверку уровней пропускаем).
+  async runChannelJob(now) {
+    const ch = await this.loadChannel();
+    if (!ch || !ch.enabled) return false;
+    const lp = localParts(now);
+
+    if (lp.hour >= DIGEST_HOUR && lp.hour < 21 && ch.lastDigest !== lp.date && (this.retryAt.digest || 0) <= now) {
+      try {
+        const r = await sendDigest(this.env, ch.id, now);
+        if (!(await this.channelFailed(ch, r))) {
+          ch.lastDigest = lp.date;
+          await this.saveChannel();
+        } else if (ch.enabled) this.retryAt.digest = now + RETRY_MS;
+      } catch (e) {
+        this.retryAt.digest = now + RETRY_MS;
+      }
+      return true;
+    }
+
+    if (lp.dow === 0 && lp.hour >= WEEKLY_HOUR && lp.hour < 23 && ch.lastWeekly !== lp.date && (this.retryAt.weekly || 0) <= now) {
+      try {
+        const r = await sendWeekly(this.env, ch.id, now);
+        if (!(await this.channelFailed(ch, r))) {
+          ch.lastWeekly = lp.date;
+          await this.saveChannel();
+        } else if (ch.enabled) this.retryAt.weekly = now + RETRY_MS;
+      } catch (e) {
+        this.retryAt.weekly = now + RETRY_MS;
+      }
+      return true;
+    }
+
+    if (now - this.lastMoveCheck >= MOVE_CHECK_MS) {
+      this.lastMoveCheck = now;
+      await this.checkMoves(ch, now, lp);
+      return true;
+    }
+    return false;
+  }
+
+  async checkMoves(ch, now, lp) {
+    const threshold = Number(this.env.CHANNEL_MOVE_PCT) || MOVE_POST_PCT;
+    const rows = await loadAllStats(this.env);
+    if (!ch.fired) ch.fired = {};
+    if (!ch.moves || ch.moves.date !== lp.date) ch.moves = { date: lp.date, n: 0 };
+    let changed = false;
+    for (const r of rows) {
+      const was = ch.fired[r.coin] || null;
+      let now_ = null;
+      if (r.change >= threshold) now_ = "up";
+      else if (r.change <= -threshold) now_ = "down";
+      if (now_ && now_ !== was) {
+        ch.fired[r.coin] = now_;
+        changed = true;
+        if (ch.moves.n < MAX_MOVE_POSTS_PER_DAY) {
+          const res = await tg(this.env, "sendMessage", { chat_id: ch.id, text: moveText(r.coin, r.change, r.price), disable_web_page_preview: true });
+          if (await this.channelFailed(ch, res)) return;
+          ch.moves.n++;
+        }
+      } else if (was === "up" && r.change < threshold * MOVE_REARM) {
+        ch.fired[r.coin] = null;
+        changed = true;
+      } else if (was === "down" && r.change > -threshold * MOVE_REARM) {
+        ch.fired[r.coin] = null;
+        changed = true;
+      }
+    }
+    if (changed) await this.saveChannel();
+  }
+
+  // Команды владельца: /channel, /channel @имя, /channel on|off, /post, /post week
+  async channelCommand(chatId, text, cmd) {
+    const arg = text.trim().split(/\s+/).slice(1).join(" ").trim();
+    const ch = await this.loadChannel();
+    const now = Date.now();
+
+    if (cmd === "/post") {
+      if (!ch) return { text: "Сначала подключи канал: /channel @имя_канала" };
+      const kind = arg.toLowerCase();
+      if (kind && kind !== "week" && kind !== "digest") return { text: "Напиши /post для сводки или /post week для итогов недели." };
+      try {
+        const r = kind === "week" ? await sendWeekly(this.env, ch.id, now) : await sendDigest(this.env, ch.id, now);
+        if (!r.ok) return { text: "Не получилось опубликовать: " + (r.desc || "Telegram не принял сообщение") };
+        return { text: "Опубликовал." };
+      } catch (e) {
+        return { text: "Не получилось получить данные для поста. Попробуй ещё раз через минуту." };
+      }
+    }
+
+    // /channel
+    if (!arg) {
+      if (!ch) return { text: "Канал не подключён. Создай канал, добавь бота администратором и напиши: /channel @имя_канала" };
+      return { text: "Канал: " + ch.id + (ch.enabled ? " (включён)" : " (выключен)") + "\nСводка каждый день в " + DIGEST_HOUR + ":00, итоги недели в воскресенье в " + WEEKLY_HOUR + ":00 (время Кишинёва), посты о движениях цены от " + (Number(this.env.CHANNEL_MOVE_PCT) || MOVE_POST_PCT) + "% за сутки.\nКоманды: /post, /post week, /channel off, /channel on, /channel @другой_канал" };
+    }
+    if (arg.toLowerCase() === "off" || arg.toLowerCase() === "on") {
+      if (!ch) return { text: "Канал ещё не подключён." };
+      ch.enabled = arg.toLowerCase() === "on";
+      await this.saveChannel();
+      return { text: ch.enabled ? "Публикации включены." : "Публикации выключены." };
+    }
+    if (!/^(@[A-Za-z][A-Za-z0-9_]{3,31}|-100\d{5,})$/.test(arg)) {
+      return { text: "Напиши имя канала с @, например: /channel @my_crypto_channel" };
+    }
+    const r = await sendMessage(this.env, arg, "✅ Канал подключён. Здесь будут сводки, движения цены и итоги недели. · Channel connected. Digests, price moves and weekly recaps will appear here.");
+    if (!r.ok) {
+      const d = r.desc.toLowerCase();
+      if (d.includes("chat not found")) return { text: "Не нашёл канал " + arg + ". Проверь имя и убедись, что бот добавлен в администраторы." };
+      if (d.includes("rights") || d.includes("administrator") || d.includes("forbidden") || r.status === 403) return { text: "У бота нет права публиковать в " + arg + ". Сделай его администратором с правом «Публикация сообщений»." };
+      return { text: "Не получилось подключить: " + (r.desc || "ошибка Telegram") };
+    }
+    const lp = localParts(now);
+    this.channel = {
+      id: arg,
+      enabled: true,
+      // Не публикуем сводку «задним числом» в день подключения.
+      lastDigest: lp.hour >= DIGEST_HOUR ? lp.date : null,
+      lastWeekly: lp.dow === 0 && lp.hour >= WEEKLY_HOUR ? lp.date : null,
+      fired: {},
+      moves: { date: lp.date, n: 0 },
+    };
+    await this.saveChannel();
+    return { text: "Подключил " + arg + ". Проверочное сообщение отправлено. Сводка выйдет завтра в " + DIGEST_HOUR + ":00 (или сегодня, если сейчас раньше). Чтобы проверить сразу, напиши /post." };
+  }
+
   // ----- проверка цен -----
 
   async alarm() {
     try {
-      await this.check();
+      // Работа для канала идёт отдельной проверкой, у каждой своя квота на запросы в сеть.
+      const ranChannelJob = await this.runChannelJob(Date.now());
+      if (!ranChannelJob) await this.check();
     } catch (e) {
       console.log("check failed: " + String(e));
     }
@@ -861,6 +1155,7 @@ export class Watcher {
     if (low === "добавить уровень") return { text: ADD_HELP };
     if (low === "портфель" || cmd === "/portfolio") return this.portfolioReply(chatId);
     if (low === "страх и жадность" || low === "индекс страха" || cmd === "/fear") return { text: fearText(await getFear(this.env)) };
+    if ((cmd === "/channel" || cmd === "/post") && this.isOwner(chatId)) return this.channelCommand(chatId, t, cmd);
     if (parsePortfolioLine(t.split("\n")[0])) return this.portfolioTrade(chatId, t);
     if (low === "график" || cmd === "/chart") return { text: CHART_HELP };
     if (cmd === "/clear") {
