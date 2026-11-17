@@ -770,6 +770,47 @@ async function postToChannel(env, chatId, text, photoUrl, caption) {
   return tg(env, "sendMessage", { chat_id: chatId, text: text, disable_web_page_preview: true });
 }
 
+const BOT_LINK = "https://t.me/coin_pulse_alert_bot";
+const PIN_TEXT =
+  "👋 О канале\n\n" +
+  "Каждый день в 9:00 — сводка по рынку: цены, изменение за сутки, индекс страха и жадности, график.\n" +
+  "Если рынок резко двигается — отдельный алерт.\n" +
+  "По воскресеньям — итоги недели.\n\n" +
+  "🔔 Хочешь свои уровни цен? Напиши боту, он пришлёт уведомление, когда монета дойдёт до нужной цены. Ещё в нём графики и учёт портфеля. Бесплатно.\n\n" +
+  "Не финансовый совет.\n\n" +
+  "———\n\n" +
+  "👋 About\n\n" +
+  "Every day at 9:00 — a market digest: prices, 24h change, Fear & Greed index, chart.\n" +
+  "Sharp move? You get a separate alert.\n" +
+  "Every Sunday — a weekly recap.\n\n" +
+  "🔔 Want your own price levels? Message the bot and it pings you when a coin reaches your price. It also has charts and portfolio tracking. Free.\n\n" +
+  "Not financial advice.";
+
+// Публикует закреплённый пост с кнопкой на бота. Возвращает { ok, pinned, desc }.
+async function postPinned(env, chatId) {
+  const base = env.TG_BASE || DEFAULT_TG_BASE;
+  let sent;
+  try {
+    const r = await fetch(base + "/bot" + env.TELEGRAM_TOKEN + "/sendMessage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: PIN_TEXT,
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: "🤖 Открыть бота · Open the bot", url: BOT_LINK }]] },
+      }),
+    });
+    sent = await r.json();
+    if (!r.ok || !sent.ok) return { ok: false, pinned: false, desc: String((sent && sent.description) || "") };
+  } catch (e) {
+    return { ok: false, pinned: false, desc: "" };
+  }
+  const id = sent.result && sent.result.message_id;
+  const pin = await tg(env, "pinChatMessage", { chat_id: chatId, message_id: id, disable_notification: true });
+  return { ok: true, pinned: pin.ok, desc: pin.desc };
+}
+
 async function btcChart(env, rangeKey, pts) {
   const points = pts || (await getCandles(env, "BTC", rangeKey));
   const info = chartSummary("BTC", rangeKey, points);
@@ -968,6 +1009,14 @@ export class Watcher {
     const ch = await this.loadChannel();
     const now = Date.now();
 
+    if (cmd === "/pin") {
+      if (!ch) return { text: "Сначала подключи канал: /channel @имя_канала" };
+      const r = await postPinned(this.env, ch.id);
+      if (!r.ok) return { text: "Не получилось опубликовать: " + (r.desc || "Telegram не принял сообщение") };
+      if (!r.pinned) return { text: "Пост опубликован, но закрепить не вышло: " + (r.desc || "нет права") + ". Дай боту в канале право «Закрепление сообщений» и напиши /pin ещё раз, а старый пост удали." };
+      return { text: "Опубликовал и закрепил пост с кнопкой." };
+    }
+
     if (cmd === "/post") {
       if (!ch) return { text: "Сначала подключи канал: /channel @имя_канала" };
       const kind = arg.toLowerCase();
@@ -984,7 +1033,7 @@ export class Watcher {
     // /channel
     if (!arg) {
       if (!ch) return { text: "Канал не подключён. Создай канал, добавь бота администратором и напиши: /channel @имя_канала" };
-      return { text: "Канал: " + ch.id + (ch.enabled ? " (включён)" : " (выключен)") + "\nСводка каждый день в " + DIGEST_HOUR + ":00, итоги недели в воскресенье в " + WEEKLY_HOUR + ":00 (время Кишинёва), посты о движениях цены от " + (Number(this.env.CHANNEL_MOVE_PCT) || MOVE_POST_PCT) + "% за сутки.\nКоманды: /post, /post week, /channel off, /channel on, /channel @другой_канал" };
+      return { text: "Канал: " + ch.id + (ch.enabled ? " (включён)" : " (выключен)") + "\nСводка каждый день в " + DIGEST_HOUR + ":00, итоги недели в воскресенье в " + WEEKLY_HOUR + ":00 (время Кишинёва), посты о движениях цены от " + (Number(this.env.CHANNEL_MOVE_PCT) || MOVE_POST_PCT) + "% за сутки.\nКоманды: /post, /post week, /pin, /channel off, /channel on, /channel @другой_канал" };
     }
     if (arg.toLowerCase() === "off" || arg.toLowerCase() === "on") {
       if (!ch) return { text: "Канал ещё не подключён." };
@@ -1155,7 +1204,7 @@ export class Watcher {
     if (low === "добавить уровень") return { text: ADD_HELP };
     if (low === "портфель" || cmd === "/portfolio") return this.portfolioReply(chatId);
     if (low === "страх и жадность" || low === "индекс страха" || cmd === "/fear") return { text: fearText(await getFear(this.env)) };
-    if ((cmd === "/channel" || cmd === "/post") && this.isOwner(chatId)) return this.channelCommand(chatId, t, cmd);
+    if ((cmd === "/channel" || cmd === "/post" || cmd === "/pin") && this.isOwner(chatId)) return this.channelCommand(chatId, t, cmd);
     if (parsePortfolioLine(t.split("\n")[0])) return this.portfolioTrade(chatId, t);
     if (low === "график" || cmd === "/chart") return { text: CHART_HELP };
     if (cmd === "/clear") {
